@@ -29,64 +29,32 @@ class WeiboCrawler:
         self.client.mount("http://", HTTPAdapter(max_retries=retries))
         self.client.mount("https://", HTTPAdapter(max_retries=retries))
 
-    def search_weibo(self, keyword, limit=100, export_dir="."):
-        weibo_count = 0
+        self.weibo_datetime_format = "%a %b %d %H:%M:%S %z %Y"
+        self.datetime_format = "%Y-%m-%d"
+
+    def search_weibo(self, keyword, limit=100, export_dir=".", start_time="", end_time=""):
         page = 0
         weibo_df = pd.DataFrame()
         while True:
             time.sleep(0.1)
             page += 1
             search_result = self._get_search_result(keyword, page)
-            items = search_result.get('data').get('cards')
-            if not len(items):
+            if not len(search_result.get('data').get('cards')):
                 break
-            for index, item in enumerate(items):
-                if item.get('card_type') == 7:  # 导语
-                    continue
-                elif item.get('card_type') == 8 or (item.get('card_type') == 11 and item.get('card_group') is None):
-                    continue
-                if item.get('mblog', None):
-                    item = item.get('mblog')
-                else:
-                    item = item.get('card_group')[0].get('mblog')
-                if item:
-                    if item.get('isLongText') is False:  # 不是长文本
-                        data = {
-                            'wid': item.get('id'),
-                            'user_name': item.get('user').get('screen_name'),
-                            'user_id': item.get('user').get('id'),
-                            'gender': item.get('user').get('gender'),
-                            'publish_time': item.get('created_at'),
-                            'text': item.get("text"),  # 仅提取内容中的文本
-                            'like_count': item.get('attitudes_count'),  # 点赞数
-                            'comment_count': item.get('comments_count'),  # 评论数
-                            'forward_count': item.get('reposts_count'),  # 转发数
-                        }
-                    else:  # 长文本涉及文本的展开
-                        long_text = self._get_long_text(item.get('id'))  # 调用函数
-                        data = {
-                            'wid': item.get('id'),
-                            'user_name': item.get('user').get('screen_name'),
-                            'user_id': item.get('user').get('id'),
-                            'gender': item.get('user').get('gender'),
-                            'publish_time': item.get('created_at'),
-                            'text': long_text,  # 仅提取内容中的文本
-                            'like_count': item.get('attitudes_count'),
-                            'comment_count': item.get('comments_count'),
-                            'forward_count': item.get('reposts_count'),
-                        }
+            temp_weibo_df = self._parse_search_result(search_result, start_time, end_time)
+            weibo_df = weibo_df.append(temp_weibo_df)
 
-                    weibo_df = weibo_df.append(data, ignore_index=True)
-                    weibo_count += 1
-            export_path = os.path.join(export_dir, keyword + ".xlsx")
-            weibo_df.to_excel(export_path)
-            if weibo_count > limit:
+            if not weibo_df.empty:
+                export_path = os.path.join(export_dir, keyword + ".xlsx")
+                weibo_df.to_excel(export_path)
+
+            if len(weibo_df) > limit:
                 break
 
     def _get_search_result(self, keyword, page):
         url = f"https://m.weibo.cn/api/container/getIndex"
         params = {
-            "containerid": "100103type=1&q={}".format(keyword),
+            "containerid": "100103type=61&q={}".format(keyword),
             "page_type": "searchall",
             "page": page
         }
@@ -110,8 +78,48 @@ class WeiboCrawler:
         data = response.get('data')
         return data.get("longTextContent")
 
-    def _parse_search_result(self, search_result):
-        pass
+    def _parse_search_result(self, search_result, start_time="", end_time=""):
+        weibo_df = pd.DataFrame()
+        items = search_result.get('data').get('cards')
+        if not len(items):
+            return weibo_df
+        for index, item in enumerate(items):
+            if item.get('card_type') == 7:  # 导语
+                continue
+            elif item.get('card_type') == 8 or (item.get('card_type') == 11 and item.get('card_group') is None):
+                continue
+            if item.get('mblog', None):
+                item = item.get('mblog')
+            else:
+                item = item.get('card_group')[0].get('mblog')
+            if item:
+                # 检查是否在要求的时间区间内
+                if not self.check_time(start_time, end_time, item.get('created_at')):
+                    continue
+
+                publish_time = self._str2datetime(item.get('created_at'), self.weibo_datetime_format).replace(tzinfo=None)
+                data = {
+                    'wid': item.get('id'),
+                    'user_name': item.get('user').get('screen_name'),  # 用户昵称
+                    'user_id': item.get('user').get('id'),  # 用户id
+                    'gender': item.get('user').get('gender'),  # 用户性别
+                    'publish_time': publish_time,  # 发布时间
+                    'text': item.get("text"),  # 仅提取内容中的文本
+                    'like_count': item.get('attitudes_count'),  # 点赞数
+                    'comment_count': item.get('comments_count'),  # 评论数
+                    'forward_count': item.get('reposts_count'),  # 转发数
+                    'origin_publish_time': item.get('created_at'),  # 原发布时间
+                }
+                if item.get('isLongText'):
+                    long_text = self._get_long_text(item.get('id'))  # 获取长文本
+                    data["text"] = long_text
+
+                weibo_df = weibo_df.append(data, ignore_index=True)
+        return weibo_df
+
+    @staticmethod
+    def _str2datetime(string, datetime_format):
+        return datetime.datetime.strptime(string, datetime_format)
 
     def get_uid(self, nickname: str) -> int:
         """get uid by nickname
@@ -130,21 +138,23 @@ class WeiboCrawler:
         else:
             return r.json()["data"]["uid"]
 
-    @staticmethod
-    def check_time(start, end, weibo):
-        start_time = datetime.datetime.strptime(start, '%Y-%m-%d')
-        end_time = datetime.datetime.strptime(end, '%Y-%m-%d')
+    def check_time(self, start_time, end_time, weibo_time):
+        check_result = True
+        weibo_time = datetime.datetime.strptime(weibo_time, self.weibo_datetime_format)
 
-        start_time = start_time.replace(tzinfo=pytz.timezone('Asia/Shanghai'))
-        end_time = end_time.replace(tzinfo=pytz.timezone('Asia/Shanghai'))
+        if start_time:
+            start_time = datetime.datetime.strptime(start_time, self.datetime_format)
+            start_time = start_time.replace(tzinfo=pytz.timezone('Asia/Shanghai'))
+            if weibo_time < start_time:
+                check_result = False
 
-        checked_time = datetime.datetime.strptime(weibo["发布时间"], '%a %b %d %H:%M:%S %z %Y')
-        if start_time <= checked_time and checked_time <= end_time:
-            return True
-        else:
-            if checked_time < start_time + datetime.timedelta(days=30):
-                return
-            return False
+        if end_time:
+            end_time = datetime.datetime.strptime(end_time, self.datetime_format)
+            end_time = end_time.replace(tzinfo=pytz.timezone('Asia/Shanghai'))
+            if weibo_time > end_time:
+                check_result = False
+
+        return check_result
 
     @staticmethod
     def check_keyword_list(keyword_list: list, text: str) -> bool:
